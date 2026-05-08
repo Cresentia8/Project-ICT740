@@ -16,8 +16,10 @@ To solve this, we are exploring a hardware-software co-design approach. By build
 
 Before we get into the communication protocols or the user interface, here is a breakdown of the specific, highly quantization-friendly network architecture we use to evaluate chess positions on the fly.
 
-### The Input: 768 Dimensions of Perspective
-To evaluate a chess position, the network first needs to "see" the board. We represent the board from a specific player's perspective using a 768-feature input array. There are 64 squares on a chessboard, and 12 possible piece types. `12 * 64 = 768`. We use a one-hot encoding system to represent the specific (piece, square) combination.
+### The Input: 1536 Dimensions of Perspective
+To evaluate a chess position, the network first needs to "see" the board. We represent the board using a 1536-feature input array. This is essentially two 768-dimensional perspective arrays (one from our perspective, one from the enemy's perspective) concatenated together right at the input level. 
+
+There are 64 squares on a chessboard, and 12 possible piece types. `12 * 64 = 768`. We use a one-hot encoding system to represent the specific (piece, square) combination.
 
 * **Our Pieces:** Pawn (0), Knight (1), Bishop (2), Rook (3), Queen (4), King (5)
 * **Enemy Pieces:** Offset by 6 (e.g., Enemy Pawn is 6)
@@ -25,10 +27,15 @@ To evaluate a chess position, the network first needs to "see" the board. We rep
 Starting from the upper-left square, the exact index for any piece on the board is calculated using this formula:
 > **Location = 64 * (piece_encoding) + 8 * (row) + column**
 
-### Projection & Perspective Merging
-Once we have our 768 input features, we project them onto a massive 2048-dimensional space, reshaping it into an `(8, 256)` tensor. We then apply a convolution of size 1 across this tensor to combine the results channel-wise into a dense **256-wide vector**.
+### Projection & The Flat 2D Flattening
+The 1536-wide input is split into its two respective halves. We project each 768-wide perspective onto a massive 2048-dimensional space. While this sounds computationally heavy, it allows the network to capture complex, non-linear piece interactions early on.
 
-We take this vector (evaluated from our perspective) and concatenate it with a similarly processed 256-wide vector evaluated from the opponent's perspective. We now have a **512-wide vector** that contains a complete, balanced understanding of the board's tension.
+Originally, we planned to reshape this data into a 3D tensor and use channel-wise convolutions. However, edge hardware compilers are notoriously strict. Complex reshapes often trigger unsupported operation errors (like the dreaded "Op 152" on the Coral TPU), causing the compiler to kick operations back to the host CPU.
+
+To ensure 100% TPU compatibility, we keep the architecture entirely flat. We pass that 2048-dimensional output directly into another massive Dense (Linear) layer to condense the data down into a refined **256-wide vector**. Keeping the math strictly 2D guarantees the silicon will accept it.
+
+### Perspective Merging
+Chess is a game of perfect information, and understanding who is winning requires looking at the board from both sides. We take the 256-wide vector evaluated from our perspective and concatenate it with the 256-wide vector evaluated from the opponent's perspective. We now have a **512-wide vector** that contains a complete, balanced understanding of the board's tension.
 
 ### Hidden Layers, Skip Connections, and the Self-Square Trick
 Now we narrow this 512-wide vector down to a single evaluation score using dense layers and a ResNet-style skip connection:
@@ -41,7 +48,8 @@ Now we narrow this 512-wide vector down to a single evaluation score using dense
 
 Throughout this pipeline, every intermediate layer uses a **Clipped ReLU** activation function that strictly bounds values between 0 and 1 to prevent overflow when deploying on integer-only hardware.
 
-<img width="541" height="821" alt="Diagram drawio" src="https://github.com/user-attachments/assets/f2e2ae10-22b3-43d4-8aad-416e4376863e" />
+<img width="541" height="821" alt="Architecture Flowchart" src="https://github.com/user-attachments/assets/f2e2ae10-22b3-43d4-8aad-416e4376863e" />
+
 ---
 
 ## 2. Dataset Generation and Edge-Aware Training
@@ -58,15 +66,15 @@ We train our model knowing its eventual destiny is the Coral USB Accelerator's I
 
 By strictly using **Clipped ReLU** (bounding outputs between 0 and 1) during every single epoch, we force the network to learn within a highly compressed mathematical space. The network physically cannot develop massive, outlier weights. When we later compress these numbers into 8-bit integers, we suffer almost zero quantization loss.
 
-### The Export Pipeline
-To transition from software to hardware execution, the model goes through a strict conversion gauntlet:
+### The Export Pipeline: Manual Graph Reconstruction via Google Colab
+To transition from software to hardware execution, the model goes through a strict conversion gauntlet. Standard converters like ONNX often fail or trigger unsupported operation errors when dealing with complex edge quantization rules. To bypass this entirely, we moved our compilation pipeline to **Google Colab** and utilized a hardcore hardware-software approach: Manual Weight Injection.
 
-1. **PyTorch to ONNX:** We export our model to the Open Neural Network Exchange format, isolating the pure mathematical graph.
-2. **ONNX to TensorFlow:** We use `onnx-tf` to translate the graph into a native TensorFlow SavedModel.
-3. **Post-Training Quantization (TFLite):** The TFLite converter squashes every Float32 weight into a static Int8 value using a small representative dataset of Lc0 positions to calibrate the bounds.
-4. **The Edge TPU Compiler:** We compile the `.tflite` file. Because we restricted our architecture to standard convolutions and dense layers, the compiler accepts 100% of the operations.
+1. **Rebuilding in Keras:** Instead of relying on an automated translator, we manually reconstructed the exact same flattened 2D architecture natively in TensorFlow/Keras within a Colab notebook.
+2. **Manual Weight Injection:** We loaded our trained PyTorch dictionary (`.pt`), extracted the raw numerical weights and biases, and forcefully injected them into the matching Keras layers. 
+3. **Post-Training Quantization (TFLite):** We pushed the TensorFlow model through the TFLite converter. The converter squashes every Float32 weight into a static Int8 value using a small representative dataset to calibrate the bounds, generating a temporary `.tflite` file.
+4. **Cloud TPU Compilation:** Finally, we ran this temporary `.tflite` file through the Edge TPU Compiler directly inside the Colab environment. Because our Keras graph perfectly matched hardware-supported operations, the compiler mapped 100% of our distilled chess intelligence directly onto the physical silicon.
 
-The result is a tiny `_edgetpu.tflite` file, ready for edge deployment.
+We then simply download the resulting `_edgetpu.tflite` file from Colab and drop it locally into our Python backend for `app.py` to use.
 
 ---
 
@@ -74,7 +82,7 @@ The result is a tiny `_edgetpu.tflite` file, ready for edge deployment.
 
 Now, it is time for the grand finale: wiring the physical Google Coral USB Accelerator directly into our UI.
 
-<img width="1089" height="1502" alt="1448" src="https://github.com/user-attachments/assets/2bbc4afc-5058-4253-8efa-01e883603b5f" />
+<img width="1089" height="1502" alt="Google Coral Edge TPU" src="https://github.com/user-attachments/assets/2bbc4afc-5058-4253-8efa-01e883603b5f" />
 
 ### Initializing the Hardware Delegate
 To communicate with the Coral Accelerator, we use the lightweight `tflite_runtime` library. By loading the compiled model with the **Edge TPU Delegate**, we explicitly tell the Python interpreter to hand off the computations to the physical USB device using the `libedgetpu` library.
@@ -83,14 +91,39 @@ To communicate with the Coral Accelerator, we use the lightweight `tflite_runtim
 When the human player makes a valid move in the Pygame window, it becomes the AI's turn. We handle the response through a hardware-accelerated search loop:
 
 1. **Generate Legal Moves:** The script asks `python-chess` for every possible legal move the AI can make.
-2. **Simulate & Translate:** For each move, we temporarily push it to the board, and translate the new board state into our 768-dimensional tensor array.
+2. **Simulate & Translate:** For each move, we temporarily push it to the board, and translate the new board state into our 1536-dimensional tensor array (properly encoding both the active and flipped perspectives).
 3. **Inference:** We send the tensor over USB. The Coral TPU instantly crunches the quantized weights and returns a single evaluation score.
 4. **Select:** The engine keeps track of the move that yielded the highest evaluation score and pushes that optimal move to the real board.
 
 ### The Final User Experience
 
-<img width="575" height="598" alt="Chess png" src="https://github.com/user-attachments/assets/05979349-afb2-4bbd-b75d-c0ce337dace7" />
+<img width="575" height="598" alt="Pygame Interface" src="https://github.com/user-attachments/assets/05979349-afb2-4bbd-b75d-c0ce337dace7" />
 
 Once this logic is slotted into the Pygame main loop, the user experience is seamless. You click your White Pawn, drag it forward two squares, and release it. Instantly, Python updates the board state, generates the AI's possible responses, fires the tensors over the USB cable to the Coral Accelerator, retrieves the evaluations, picks the optimal move, and updates the UI. 
 
 Driven entirely by a custom neural network running on low-power edge hardware—no cloud APIs, no massive desktop GPUs—just pure, localized edge intelligence.
+
+---
+
+## Setup and Installation
+
+Follow these steps to set up the hardware, install the dependencies, and run the edge-accelerated chess engine on your local machine.
+
+### Step 1: Hardware Prerequisites
+1. Obtain a **Google Coral USB Accelerator**.
+2. Install the official Edge TPU Runtime for your specific operating system (Windows, Linux, or macOS). 
+3. Plug the Coral USB Accelerator into an available **USB 3.0** port on your computer. 
+### Step 2: Clone the Repository
+Open your terminal or command prompt and clone this repository to your local machine:
+```bash
+git clone [https://github.com/YourUsername/Project-ICT740.git](https://github.com/YourUsername/Project-ICT740.git)
+cd Project-ICT740
+```
+### Step 3: Install Software Dependencies
+```bash
+pip install pygame chess numpy torch tflite_runtime
+```
+### Step 4: Run the app
+```bash
+python app.py
+```
