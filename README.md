@@ -119,6 +119,7 @@ Open your terminal or command prompt and clone this repository to your local mac
 git clone [https://github.com/YourUsername/Project-ICT740.git](https://github.com/YourUsername/Project-ICT740.git)
 cd Project-ICT740
 ```
+and download this file in the same folder https://drive.google.com/file/d/1Nj9Uac3XYkiynsrmAKigC2Xtm3QBIfws/view?usp=sharing
 ### Step 3: Install Software Dependencies
 ```bash
 pip install pygame chess numpy torch tflite_runtime
